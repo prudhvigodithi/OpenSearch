@@ -78,7 +78,9 @@ public class ReplicationGroup {
                 skippedShards.add(shard);
             } else {
                 if (trackedAllocationIds.contains(shard.allocationId().getId())) {
-                    replicationTargets.add(shard);
+                    if (!shard.isSearchOnly()) {
+                        replicationTargets.add(shard);
+                    }
                 } else {
                     assert inSyncAllocationIds.contains(shard.allocationId().getId()) == false : "in-sync shard copy but not tracked: "
                         + shard;
@@ -87,7 +89,9 @@ public class ReplicationGroup {
                 if (shard.relocating()) {
                     ShardRouting relocationTarget = shard.getTargetRelocatingShard();
                     if (trackedAllocationIds.contains(relocationTarget.allocationId().getId())) {
-                        replicationTargets.add(relocationTarget);
+                        if (!relocationTarget.isSearchOnly()) {
+                            replicationTargets.add(relocationTarget);
+                        }
                     } else {
                         skippedShards.add(relocationTarget);
                         assert inSyncAllocationIds.contains(relocationTarget.allocationId().getId()) == false
