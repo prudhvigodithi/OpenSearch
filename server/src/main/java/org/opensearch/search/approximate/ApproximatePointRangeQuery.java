@@ -103,6 +103,7 @@ public class ApproximatePointRangeQuery extends ApproximateQuery {
 
     @Override
     public final ConstantScoreWeight createWeight(IndexSearcher searcher, ScoreMode scoreMode, float boost) throws IOException {
+        System.out.println("Entering the createWeight section of ApproximatePointRangeQuery");
         Weight pointRangeQueryWeight = pointRangeQuery.createWeight(searcher, scoreMode, boost);
 
         return new ConstantScoreWeight(this, boost) {
@@ -434,37 +435,57 @@ public class ApproximatePointRangeQuery extends ApproximateQuery {
 
     @Override
     public boolean canApproximate(SearchContext context) {
+        boolean finalReturn;
+        System.out.println("Entering the ApproximatePointRangeQuery canApproximate");
+
         if (context == null) {
-            return false;
+            finalReturn = false;
+            return finalReturn;
         }
         if (context.aggregations() != null) {
-            return false;
+            finalReturn = false;
+            return finalReturn;
         }
+
+        // When "track_total_hits": true
+        if (context.trackTotalHitsUpTo() == SearchContext.TRACK_TOTAL_HITS_ACCURATE) {
+            finalReturn = false;
+            return finalReturn;
+        }
+
         // size 0 could be set for caching
         if (context.from() + context.size() == 0) {
             this.setSize(SearchContext.DEFAULT_TRACK_TOTAL_HITS_UP_TO);
         } else {
             this.setSize(Math.max(context.from() + context.size(), context.trackTotalHitsUpTo()));
         }
+        System.out.println("The size is " + this.getSize());
         if (context.request() != null && context.request().source() != null) {
             FieldSortBuilder primarySortField = FieldSortBuilder.getPrimaryFieldSortOrNull(context.request().source());
             if (primarySortField != null) {
+                System.out.println("The primarySortField fieldName is " + primarySortField.fieldName());
+                System.out.println("The primarySortField order is " + primarySortField.order());
                 if (!primarySortField.fieldName().equals(pointRangeQuery.getField())) {
-                    return false;
+                    finalReturn = false;
+                    return finalReturn;
                 }
                 if (primarySortField.missing() != null) {
                     // Cannot sort documents missing this field.
-                    return false;
+                    finalReturn = false;
+                    return finalReturn;
                 }
                 if (context.request().source().searchAfter() != null) {
                     // TODO: We *could* optimize searchAfter, especially when this is the only sort field, but existing pruning is pretty
                     // good.
-                    return false;
+                    finalReturn = false;
+                    return finalReturn;
                 }
                 this.setSortOrder(primarySortField.order());
             }
         }
-        return true;
+        finalReturn = true;
+        System.out.println("The finalReturn is " + finalReturn);
+        return finalReturn;
     }
 
     @Override
