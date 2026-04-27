@@ -740,7 +740,7 @@ public class ClusterStatsIT extends OpenSearchIntegTestCase {
         ensureGreen();
 
         client().admin().indices().prepareCreate("test1").setMapping("{\"properties\":{\"foo\":{\"type\": \"keyword\"}}}").get();
-        IndexRequest indexRequest = new IndexRequest("test1").id("doc_id").source(Map.of("test_type", "metrics_filter"));
+        IndexRequest indexRequest = new IndexRequest("test1").id("doc_id").source(Map.of("foo", "metrics_filter"));
         client().index(indexRequest);
 
         ClusterStatsRequestBuilder clusterStatsRequestBuilder = client().admin()
