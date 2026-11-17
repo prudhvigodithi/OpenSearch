@@ -12,6 +12,7 @@ import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
 import org.opensearch.test.OpenSearchTestCase;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -39,7 +40,7 @@ public class IntraSegmentSearchDeciderTests extends OpenSearchTestCase {
     public void testAggregationsSupportsIntraSegment() {
         IntraSegmentSearchDecider decider = new IntraSegmentSearchDecider();
         AggregatorFactories aggs = mock(AggregatorFactories.class);
-        when(aggs.allFactoriesSupportIntraSegmentSearch()).thenReturn(true);
+        when(aggs.allFactoriesSupportIntraSegmentSearch(any())).thenReturn(true);
         decider.evaluateForAggregations(aggs);
         assertTrue(decider.shouldUseIntraSegmentSearch());
         assertEquals("query/aggregations support intra-segment search", decider.getReason());
@@ -48,7 +49,7 @@ public class IntraSegmentSearchDeciderTests extends OpenSearchTestCase {
     public void testAggregationsDoesNotSupportIntraSegment() {
         IntraSegmentSearchDecider decider = new IntraSegmentSearchDecider();
         AggregatorFactories aggs = mock(AggregatorFactories.class);
-        when(aggs.allFactoriesSupportIntraSegmentSearch()).thenReturn(false);
+        when(aggs.allFactoriesSupportIntraSegmentSearch(any())).thenReturn(false);
         decider.evaluateForAggregations(aggs);
         assertFalse(decider.shouldUseIntraSegmentSearch());
         assertEquals("some aggregations do not support intra-segment search", decider.getReason());
@@ -61,7 +62,7 @@ public class IntraSegmentSearchDeciderTests extends OpenSearchTestCase {
         when(query.getName()).thenReturn("test_query");
         decider.evaluateForQuery(query);
         AggregatorFactories aggs = mock(AggregatorFactories.class);
-        when(aggs.allFactoriesSupportIntraSegmentSearch()).thenReturn(true);
+        when(aggs.allFactoriesSupportIntraSegmentSearch(any())).thenReturn(true);
         decider.evaluateForAggregations(aggs);
         assertFalse(decider.shouldUseIntraSegmentSearch());
         assertEquals("test_query does not support intra-segment search", decider.getReason());
@@ -73,7 +74,7 @@ public class IntraSegmentSearchDeciderTests extends OpenSearchTestCase {
         when(query.supportsIntraSegmentSearch()).thenReturn(true);
         decider.evaluateForQuery(query);
         AggregatorFactories aggs = mock(AggregatorFactories.class);
-        when(aggs.allFactoriesSupportIntraSegmentSearch()).thenReturn(false);
+        when(aggs.allFactoriesSupportIntraSegmentSearch(any())).thenReturn(false);
         decider.evaluateForAggregations(aggs);
         assertFalse(decider.shouldUseIntraSegmentSearch());
         assertEquals("some aggregations do not support intra-segment search", decider.getReason());
@@ -85,7 +86,7 @@ public class IntraSegmentSearchDeciderTests extends OpenSearchTestCase {
         when(query.supportsIntraSegmentSearch()).thenReturn(true);
         decider.evaluateForQuery(query);
         AggregatorFactories aggs = mock(AggregatorFactories.class);
-        when(aggs.allFactoriesSupportIntraSegmentSearch()).thenReturn(true);
+        when(aggs.allFactoriesSupportIntraSegmentSearch(any())).thenReturn(true);
         decider.evaluateForAggregations(aggs);
         assertTrue(decider.shouldUseIntraSegmentSearch());
         assertEquals("query/aggregations support intra-segment search", decider.getReason());

@@ -1442,7 +1442,7 @@ final class DefaultSearchContext extends SearchContext {
             request().source().query().visit(visitor);
         }
         if (aggregations() != null && aggregations().factories() != null) {
-            decider.evaluateForAggregations(aggregations().factories());
+            decider.evaluateForAggregations(aggregations().factories(), this);
         }
         boolean result = decider.shouldUseIntraSegmentSearch();
         logger.debug(

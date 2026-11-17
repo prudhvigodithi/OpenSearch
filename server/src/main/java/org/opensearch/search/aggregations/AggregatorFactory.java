@@ -32,6 +32,7 @@
 
 package org.opensearch.search.aggregations;
 
+import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.internal.SearchContext;
@@ -130,6 +131,16 @@ public abstract class AggregatorFactory {
      */
     protected boolean supportsIntraSegmentSearch() {
         return false;
+    }
+
+    /**
+     * Variant of {@link #supportsIntraSegmentSearch()} that can take the request into account, e.g. to decline intra-segment
+     * search when a whole-segment fast path would apply for the request's query. {@code searchContext} is {@code null} when
+     * the request is not known; implementations must then answer based on the factory alone. Defaults to
+     * {@link #supportsIntraSegmentSearch()}.
+     */
+    protected boolean supportsIntraSegmentSearch(@Nullable SearchContext searchContext) {
+        return supportsIntraSegmentSearch();
     }
 
     public boolean evaluateChildFactories() {

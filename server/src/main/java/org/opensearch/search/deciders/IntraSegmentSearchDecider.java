@@ -10,6 +10,7 @@ package org.opensearch.search.deciders;
 
 import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.search.aggregations.AggregatorFactories;
+import org.opensearch.search.internal.SearchContext;
 
 /**
  * Evaluates whether queries and aggregations support intra-segment search.
@@ -31,11 +32,19 @@ public class IntraSegmentSearchDecider {
     }
 
     public void evaluateForAggregations(AggregatorFactories aggregations) {
+        evaluateForAggregations(aggregations, null);
+    }
+
+    /**
+     * Evaluates the aggregation tree for the given request; {@code searchContext} lets top-level factories decline when a
+     * whole-segment fast path would apply to the request (see {@link AggregatorFactories#allFactoriesSupportIntraSegmentSearch(SearchContext)}).
+     */
+    public void evaluateForAggregations(AggregatorFactories aggregations, SearchContext searchContext) {
         if (aggregations == null) {
             return;
         }
         hasAggregations = true;
-        if (aggregations.allFactoriesSupportIntraSegmentSearch() == false) {
+        if (aggregations.allFactoriesSupportIntraSegmentSearch(searchContext) == false) {
             aggSupport = false;
             reason = "some aggregations do not support intra-segment search";
         }

@@ -34,6 +34,7 @@ package org.opensearch.search.aggregations;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequestValidationException;
+import org.opensearch.common.Nullable;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.xcontent.SuggestingErrorOnUnknown;
 import org.opensearch.core.common.ParsingException;
@@ -276,8 +277,18 @@ public class AggregatorFactories {
     }
 
     public boolean allFactoriesSupportIntraSegmentSearch() {
+        return allFactoriesSupportIntraSegmentSearch(null);
+    }
+
+    /**
+     * Whether every factory in this tree supports intra-segment search for the given request. The request context is only
+     * passed to these (top-level) factories; sub-aggregation factories are evaluated without it.
+     *
+     * @param searchContext the request being evaluated, or {@code null} if unknown
+     */
+    public boolean allFactoriesSupportIntraSegmentSearch(@Nullable SearchContext searchContext) {
         for (AggregatorFactory factory : factories) {
-            if (factory.supportsIntraSegmentSearch() == false || factory.evaluateChildFactoriesForIntraSegment() == false) {
+            if (factory.supportsIntraSegmentSearch(searchContext) == false || factory.evaluateChildFactoriesForIntraSegment() == false) {
                 return false;
             }
         }

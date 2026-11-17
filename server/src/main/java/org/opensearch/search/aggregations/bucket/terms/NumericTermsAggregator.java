@@ -56,6 +56,7 @@ import org.opensearch.search.aggregations.CardinalityUpperBound;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalMultiBucketAggregation;
 import org.opensearch.search.aggregations.InternalOrder;
+import org.opensearch.search.aggregations.IntraSegmentSliceMergeable;
 import org.opensearch.search.aggregations.LeafBucketCollector;
 import org.opensearch.search.aggregations.LeafBucketCollectorBase;
 import org.opensearch.search.aggregations.StarTreeBucketCollector;
@@ -89,13 +90,16 @@ import static org.opensearch.search.aggregations.InternalOrder.isKeyOrder;
  *
  * @opensearch.internal
  */
-public class NumericTermsAggregator extends TermsAggregator implements StarTreePreComputeCollector {
+public class NumericTermsAggregator extends TermsAggregator implements StarTreePreComputeCollector, IntraSegmentSliceMergeable {
     private final ResultStrategy<?, ?> resultStrategy;
     private final ValuesSource.Numeric valuesSource;
     private final LongKeyedBucketOrds bucketOrds;
     private final LongFilter longFilter;
     private final String fieldName;
     private String resultSelectionStrategy;
+    // intra-segment slice merge statistics, reported in the profile debug info
+    private int mergedSlices = 0;
+    private long mergeNanos = 0;
 
     public NumericTermsAggregator(
         String name,
@@ -239,6 +243,40 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
         return resultStrategy.buildAggregations(owningBucketOrds);
     }
 
+    /**
+     * Under intra-segment search, a top-level standard numeric terms aggregation without sub-aggregations defers its build so
+     * the per-value counts of all slices are summed before the shard_size cutoff is applied, making the result identical to
+     * non-concurrent execution. Bucket ordinals differ between slices, so counts are re-keyed by the (sortable long) value.
+     */
+    @Override
+    public boolean canMergeIntraSegmentSlices() {
+        return context.shouldUseIntraSegmentSearch()
+            && context.isStreamSearch() == false
+            && parent == null
+            && subAggregators.length == 0
+            && resultStrategy instanceof StandardTermsResultStrategy;
+    }
+
+    @Override
+    public void mergeIntraSegmentSlice(Aggregator other) throws IOException {
+        final long start = System.nanoTime();
+        final NumericTermsAggregator from = (NumericTermsAggregator) other;
+        final BucketOrdsEnum ordsEnum = from.bucketOrds.ordsEnum(0);
+        while (ordsEnum.next()) {
+            long docCount = from.bucketDocCount(ordsEnum.ord());
+            if (docCount == 0) {
+                continue;
+            }
+            long bucketOrd = bucketOrds.add(0, ordsEnum.value());
+            if (bucketOrd < 0) {
+                bucketOrd = -1 - bucketOrd;
+            }
+            incrementBucketDocCount(bucketOrd, docCount);
+        }
+        mergedSlices++;
+        mergeNanos += System.nanoTime() - start;
+    }
+
     @Override
     public InternalAggregation buildEmptyAggregation() {
         return resultStrategy.buildEmptyResult();
@@ -255,6 +293,10 @@ public class NumericTermsAggregator extends TermsAggregator implements StarTreeP
         add.accept("result_strategy", resultStrategy.describe());
         add.accept("total_buckets", bucketOrds.size());
         add.accept("result_selection_strategy", resultSelectionStrategy);
+        if (mergedSlices > 0) {
+            add.accept("intra_segment_merged_slices", mergedSlices);
+            add.accept("intra_segment_merge_nanos", mergeNanos);
+        }
     }
 
     public String getResultSelectionStrategy() {

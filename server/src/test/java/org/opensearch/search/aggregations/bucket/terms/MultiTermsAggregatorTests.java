@@ -8,6 +8,7 @@
 
 package org.opensearch.search.aggregations.bucket.terms;
 
+import org.apache.lucene.document.Document;
 import org.apache.lucene.document.DoubleDocValuesField;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FloatDocValuesField;
@@ -17,10 +18,15 @@ import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
 import org.apache.lucene.document.StringField;
+import org.apache.lucene.index.DirectoryReader;
+import org.apache.lucene.index.IndexReader;
+import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.Term;
+import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.index.RandomIndexWriter;
 import org.apache.lucene.util.BytesRef;
 import org.opensearch.common.CheckedConsumer;
@@ -72,7 +78,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -82,12 +91,14 @@ import static java.util.Collections.emptyMap;
 import static java.util.Collections.singletonList;
 import static java.util.Collections.singletonMap;
 import static java.util.stream.Collectors.toList;
+import static org.opensearch.test.InternalAggregationTestCase.DEFAULT_MAX_BUCKETS;
 import static org.hamcrest.Matchers.closeTo;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.lessThanOrEqualTo;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -1025,5 +1036,255 @@ public class MultiTermsAggregatorTests extends AggregatorTestCase {
             null,
             Collections.emptyMap()
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Intra-segment concurrent search
+    // ---------------------------------------------------------------------------------------------------------------
+
+    private static final String INTRA_FILTER = "filter";
+
+    /** keywords/longs hold unique values per document; an empty list means the field is missing. */
+    private record IntraDoc(List<String> keywords, List<Long> longs, int metric, boolean filtered) {
+    }
+
+    private static int skewedIndex(int cardinality) {
+        return Math.min(cardinality - 1, (int) Math.floor(cardinality * Math.pow(random().nextDouble(), 3)));
+    }
+
+    private static List<IntraDoc> randomIntraDocs(int numDocs, int keywordCardinality, int longCardinality, boolean multiValued) {
+        List<IntraDoc> docs = new ArrayList<>(numDocs);
+        for (int i = 0; i < numDocs; i++) {
+            Set<String> keywords = new TreeSet<>();
+            Set<Long> longs = new TreeSet<>();
+            int numKeywords = random().nextInt(10) == 0 ? 0 : (multiValued ? randomIntBetween(1, 2) : 1);
+            for (int v = 0; v < numKeywords; v++) {
+                keywords.add(String.format(Locale.ROOT, "k%05d", skewedIndex(keywordCardinality)));
+            }
+            int numLongs = random().nextInt(10) == 0 ? 0 : (multiValued ? randomIntBetween(1, 2) : 1);
+            for (int v = 0; v < numLongs; v++) {
+                longs.add((long) skewedIndex(longCardinality));
+            }
+            docs.add(new IntraDoc(new ArrayList<>(keywords), new ArrayList<>(longs), randomIntBetween(0, 100), randomBoolean()));
+        }
+        return docs;
+    }
+
+    private static void indexIntraDocs(Directory directory, List<IntraDoc> docs, int numSegments) throws IOException {
+        try (
+            RandomIndexWriter indexWriter = new RandomIndexWriter(
+                random(),
+                directory,
+                newIndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE)
+            )
+        ) {
+            int docsPerSegment = Math.max(1, docs.size() / numSegments);
+            for (int i = 0; i < docs.size(); i++) {
+                IntraDoc doc = docs.get(i);
+                Document document = new Document();
+                for (String keyword : doc.keywords()) {
+                    document.add(new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef(keyword)));
+                    document.add(new StringField(KEYWORD_FIELD, keyword, Field.Store.NO));
+                }
+                for (Long value : doc.longs()) {
+                    document.add(new SortedNumericDocValuesField(LONG_FIELD, value));
+                }
+                document.add(new NumericDocValuesField(INT_FIELD, doc.metric()));
+                document.add(new StringField(INTRA_FILTER, doc.filtered() ? "yes" : "no", Field.Store.NO));
+                indexWriter.addDocument(document);
+                if ((i + 1) % docsPerSegment == 0) {
+                    indexWriter.commit();
+                }
+            }
+        }
+    }
+
+    /** Brute-force counts per "keyword|long" key; multi_terms buckets are the cartesian product of the doc's values. */
+    private static Map<String, Long> expectedIntraCounts(List<IntraDoc> docs, boolean filteredOnly) {
+        Map<String, Long> counts = new HashMap<>();
+        for (IntraDoc doc : docs) {
+            if (filteredOnly && doc.filtered() == false) {
+                continue;
+            }
+            for (String keyword : doc.keywords()) {
+                for (Long value : doc.longs()) {
+                    counts.merge(keyword + "|" + value, 1L, Long::sum);
+                }
+            }
+        }
+        return counts;
+    }
+
+    private static Query intraQuery(boolean filteredOnly) {
+        return filteredOnly ? new TermQuery(new Term(INTRA_FILTER, "yes")) : new MatchAllDocsQuery();
+    }
+
+    private static MultiTermsAggregationBuilder intraBuilder() {
+        return new MultiTermsAggregationBuilder(AGG_NAME).terms(
+            asList(
+                new MultiTermsValuesSourceConfig.Builder().setFieldName(KEYWORD_FIELD).build(),
+                new MultiTermsValuesSourceConfig.Builder().setFieldName(LONG_FIELD).build()
+            )
+        );
+    }
+
+    private InternalMultiTerms[] baselineAndIntra(IndexSearcher searcher, Query query, AggregationBuilder builder) throws IOException {
+        MappedFieldType[] fieldTypes = mappedFieldTypeMap.values().toArray(new MappedFieldType[] {});
+        InternalMultiTerms baseline = searchAndReduceWithIntraSegmentPartitions(
+            createIndexSettings(),
+            searcher,
+            query,
+            builder,
+            1,
+            DEFAULT_MAX_BUCKETS,
+            fieldTypes
+        );
+        InternalMultiTerms intra = searchAndReduceWithIntraSegmentPartitions(
+            createIndexSettings(),
+            searcher,
+            query,
+            builder,
+            randomIntBetween(2, 6),
+            DEFAULT_MAX_BUCKETS,
+            fieldTypes
+        );
+        return new InternalMultiTerms[] { baseline, intra };
+    }
+
+    public void testSupportsIntraSegmentSearch() throws IOException {
+        try (Directory directory = newDirectory(); RandomIndexWriter indexWriter = new RandomIndexWriter(random(), directory)) {
+            indexWriter.addDocument(
+                asList(new SortedSetDocValuesField(KEYWORD_FIELD, new BytesRef("a")), new SortedNumericDocValuesField(LONG_FIELD, 1))
+            );
+            try (IndexReader reader = indexWriter.getReader()) {
+                IndexSearcher searcher = newIndexSearcher(reader);
+                MappedFieldType[] fieldTypes = mappedFieldTypeMap.values().toArray(new MappedFieldType[] {});
+                QueryShardContext queryShardContext = createSearchContext(
+                    searcher,
+                    createIndexSettings(),
+                    new MatchAllDocsQuery(),
+                    null,
+                    fieldTypes
+                ).getQueryShardContext();
+                assertTrue(
+                    AggregatorFactories.builder()
+                        .addAggregator(intraBuilder())
+                        .build(queryShardContext, null)
+                        .allFactoriesSupportIntraSegmentSearch()
+                );
+                assertTrue(
+                    AggregatorFactories.builder()
+                        .addAggregator(intraBuilder().subAggregation(new MaxAggregationBuilder("max").field(INT_FIELD)))
+                        .build(queryShardContext, null)
+                        .allFactoriesSupportIntraSegmentSearch()
+                );
+            }
+        }
+    }
+
+    /** Low cardinality (fewer combinations than shard_size): intra-segment results must be identical to non-intra. */
+    public void testIntraSegmentLowCardinalityMatchesNonIntra() throws IOException {
+        List<IntraDoc> docs = randomIntraDocs(randomIntBetween(200, 800), randomIntBetween(1, 3), randomIntBetween(1, 3), randomBoolean());
+        try (Directory directory = newDirectory()) {
+            indexIntraDocs(directory, docs, randomIntBetween(1, 4));
+            try (IndexReader reader = maybeWrapReaderEs(DirectoryReader.open(directory))) {
+                IndexSearcher searcher = newIndexSearcher(reader);
+                for (boolean filteredOnly : new boolean[] { true, false }) {
+                    for (int variant = 0; variant < 5; variant++) {
+                        MultiTermsAggregationBuilder builder = intraBuilder().size(randomIntBetween(1, 12));
+                        switch (variant) {
+                            case 0:
+                                break;
+                            case 1:
+                                builder.order(BucketOrder.key(randomBoolean()));
+                                break;
+                            case 2:
+                                builder.order(BucketOrder.count(true));
+                                break;
+                            case 3:
+                                builder.subAggregation(new MaxAggregationBuilder("max").field(INT_FIELD));
+                                break;
+                            case 4:
+                                builder.subAggregation(new MaxAggregationBuilder("max").field(INT_FIELD))
+                                    .order(BucketOrder.aggregation("max", randomBoolean()));
+                                break;
+                            default:
+                                throw new AssertionError();
+                        }
+                        if (randomBoolean()) {
+                            builder.collectMode(randomFrom(Aggregator.SubAggCollectionMode.values()));
+                        }
+                        InternalMultiTerms[] results = baselineAndIntra(searcher, intraQuery(filteredOnly), builder);
+                        assertEquals(builder.toString(), results[0], results[1]);
+                        Map<String, Long> expected = expectedIntraCounts(docs, filteredOnly);
+                        if (builder.size() >= expected.size() && variant == 0) {
+                            Map<String, Long> actual = new HashMap<>();
+                            results[1].getBuckets().forEach(b -> actual.put(b.getKeyAsString(), b.getDocCount()));
+                            assertEquals(expected, actual);
+                            assertEquals(0, results[1].getSumOfOtherDocCounts());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public void testIntraSegmentMinDocCountZero() throws IOException {
+        List<IntraDoc> docs = randomIntraDocs(randomIntBetween(200, 800), randomIntBetween(1, 3), randomIntBetween(1, 3), randomBoolean());
+        try (Directory directory = newDirectory()) {
+            indexIntraDocs(directory, docs, randomIntBetween(1, 4));
+            try (IndexReader reader = maybeWrapReaderEs(DirectoryReader.open(directory))) {
+                IndexSearcher searcher = newIndexSearcher(reader);
+                MultiTermsAggregationBuilder builder = intraBuilder().minDocCount(0).size(100);
+                InternalMultiTerms[] results = baselineAndIntra(searcher, new TermQuery(new Term(INTRA_FILTER, "yes")), builder);
+                assertEquals(results[0], results[1]);
+                assertEquals(expectedIntraCounts(docs, false).size(), results[1].getBuckets().size());
+                Map<String, Long> expected = expectedIntraCounts(docs, true);
+                for (InternalMultiTerms.Bucket bucket : results[1].getBuckets()) {
+                    assertEquals(expected.getOrDefault(bucket.getKeyAsString(), 0L).longValue(), bucket.getDocCount());
+                }
+            }
+        }
+    }
+
+    /**
+     * High cardinality: partitions apply shard_size independently (multi-shard semantics), so counts may be
+     * under-estimated but never over-counted, the error bound must hold, and the totals must add up. With
+     * shard_size >= cardinality the result is exact.
+     */
+    public void testIntraSegmentHighCardinality() throws IOException {
+        List<IntraDoc> docs = randomIntraDocs(randomIntBetween(3000, 6000), randomIntBetween(20, 40), randomIntBetween(20, 40), false);
+        try (Directory directory = newDirectory()) {
+            indexIntraDocs(directory, docs, randomIntBetween(1, 2));
+            try (IndexReader reader = maybeWrapReaderEs(DirectoryReader.open(directory))) {
+                IndexSearcher searcher = newIndexSearcher(reader);
+                boolean filteredOnly = randomBoolean();
+                Map<String, Long> expected = expectedIntraCounts(docs, filteredOnly);
+                long total = expected.values().stream().mapToLong(Long::longValue).sum();
+
+                MultiTermsAggregationBuilder approx = intraBuilder().size(10).showTermDocCountError(true);
+                InternalMultiTerms[] results = baselineAndIntra(searcher, intraQuery(filteredOnly), approx);
+                for (InternalMultiTerms result : results) {
+                    assertEquals(10, result.getBuckets().size());
+                    long bucketSum = 0;
+                    for (InternalMultiTerms.Bucket bucket : result.getBuckets()) {
+                        long trueCount = expected.get(bucket.getKeyAsString());
+                        assertThat(bucket.getDocCount(), lessThanOrEqualTo(trueCount));
+                        assertThat(trueCount - bucket.getDocCount(), lessThanOrEqualTo(result.getDocCountError()));
+                        assertThat(trueCount - bucket.getDocCount(), lessThanOrEqualTo(bucket.getDocCountError()));
+                        bucketSum += bucket.getDocCount();
+                    }
+                    assertEquals(total, bucketSum + result.getSumOfOtherDocCounts());
+                }
+                for (InternalMultiTerms.Bucket bucket : results[0].getBuckets()) {
+                    assertEquals(expected.get(bucket.getKeyAsString()).longValue(), bucket.getDocCount());
+                }
+
+                MultiTermsAggregationBuilder exact = intraBuilder().size(10).shardSize(expected.size() + 1);
+                results = baselineAndIntra(searcher, intraQuery(filteredOnly), exact);
+                assertEquals(results[0], results[1]);
+                assertEquals(0, results[1].getDocCountError());
+            }
+        }
     }
 }

@@ -67,6 +67,7 @@ import org.opensearch.search.aggregations.CardinalityUpperBound;
 import org.opensearch.search.aggregations.InternalAggregation;
 import org.opensearch.search.aggregations.InternalMultiBucketAggregation;
 import org.opensearch.search.aggregations.InternalOrder;
+import org.opensearch.search.aggregations.IntraSegmentSliceMergeable;
 import org.opensearch.search.aggregations.LeafBucketCollector;
 import org.opensearch.search.aggregations.LeafBucketCollectorBase;
 import org.opensearch.search.aggregations.StarTreeBucketCollector;
@@ -98,7 +99,10 @@ import static org.apache.lucene.index.SortedSetDocValues.NO_MORE_DOCS;
  *
  * @opensearch.internal
  */
-public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggregator implements StarTreePreComputeCollector {
+public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggregator
+    implements
+        StarTreePreComputeCollector,
+        IntraSegmentSliceMergeable {
     protected final ResultStrategy<?, ?, ?> resultStrategy;
     protected final ValuesSource.Bytes.WithOrdinals valuesSource;
 
@@ -112,6 +116,9 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
     protected int segmentsWithMultiValuedOrds = 0;
     protected CardinalityUpperBound cardinalityUpperBound;
     private String resultSelectionStrategy;
+    // intra-segment slice merge statistics, reported in the profile debug info
+    private int mergedSlices = 0;
+    private long mergeNanos = 0;
 
     public GlobalOrdinalsStringTermsAggregator(
         String name,
@@ -183,6 +190,13 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
             if (weight.count(ctx) == 0) {
                 // No documents matches top level query on this segment, we can skip the segment entirely
                 return true;
+            } else if (context.shouldUseIntraSegmentSearch()) {
+                // Under intra-segment search a segment may be split into doc-id-range partitions that are collected
+                // by separate collectors, each of which calls getLeafCollector (and therefore this method) for the
+                // same segment. Term doc frequencies and weight#count describe the whole segment, not the partition,
+                // so precomputing from them would add the segment's counts once per partition. Fall back to
+                // doc-by-doc collection, which the bulk scorer restricts to the partition's doc-id range.
+                return false;
             } else if (weight.count(ctx) != ctx.reader().maxDoc()) {
                 // weight.count(ctx) == ctx.reader().maxDoc() implies there are no deleted documents and
                 // top-level query matches all docs in the segment
@@ -433,6 +447,50 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
         return resultStrategy.buildAggregations(owningBucketOrds);
     }
 
+    /**
+     * Under intra-segment search, a top-level standard terms aggregation without sub-aggregations defers its build so the
+     * per-ordinal counts of all slices are summed before the shard_size cutoff is applied, making the result identical to
+     * non-concurrent execution. All slices see the same global ordinals (they come from the same shard reader), so counts
+     * can be merged by global ordinal. Sub-aggregations are excluded because their per-bucket state would also need merging.
+     */
+    @Override
+    public boolean canMergeIntraSegmentSlices() {
+        return context.shouldUseIntraSegmentSearch()
+            && context.isStreamSearch() == false
+            && parent == null
+            && subAggregators.length == 0
+            && resultStrategy instanceof StandardTermsResults
+            && (collectionStrategy instanceof DenseGlobalOrds || collectionStrategy.getClass() == RemapGlobalOrds.class);
+    }
+
+    @Override
+    public void mergeIntraSegmentSlice(Aggregator other) throws IOException {
+        final long start = System.nanoTime();
+        final GlobalOrdinalsStringTermsAggregator from = (GlobalOrdinalsStringTermsAggregator) other;
+        assert from.valueCount == valueCount : "slices must share the same global ordinals";
+        if (collectionStrategy instanceof DenseGlobalOrds && from.collectionStrategy instanceof DenseGlobalOrds) {
+            // bucket ordinal == global ordinal on both sides: add the doc count arrays element-wise
+            final long size = Math.min(valueCount, from.docCounts.size());
+            grow(size);
+            for (long globalOrd = 0; globalOrd < size; globalOrd++) {
+                final long docCount = from.docCounts.get(globalOrd);
+                if (docCount != 0) {
+                    docCounts.increment(globalOrd, docCount);
+                }
+            }
+        } else {
+            from.collectionStrategy.forEachCollected((globalOrd, docCount) -> {
+                long bucketOrd = collectionStrategy.getOrAddBucketOrd(0, globalOrd);
+                if (bucketOrd < 0) {
+                    bucketOrd = -1 - bucketOrd;
+                }
+                incrementBucketDocCount(bucketOrd, docCount);
+            });
+        }
+        mergedSlices++;
+        mergeNanos += System.nanoTime() - start;
+    }
+
     @Override
     public InternalAggregation buildEmptyAggregation() {
         return resultStrategy.buildEmptyResult();
@@ -448,6 +506,10 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
         add.accept("segments_with_multi_valued_ords", segmentsWithMultiValuedOrds);
         add.accept("has_filter", acceptedGlobalOrdinals != ALWAYS_TRUE);
         add.accept("result_selection_strategy", resultSelectionStrategy);
+        if (mergedSlices > 0) {
+            add.accept("intra_segment_merged_slices", mergedSlices);
+            add.accept("intra_segment_merge_nanos", mergeNanos);
+        }
     }
 
     public String getResultSelectionStrategy() {
@@ -722,6 +784,16 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
          * Convert the global ordinal into a bucket ordinal.
          */
         abstract long getOrAddBucketOrd(long owningBucketOrd, long globalOrd) throws IOException;
+
+        /**
+         * Iterate the global ordinals collected for owning bucket 0 with a non-zero doc count, without adding buckets.
+         * Used to merge intra-segment slices.
+         */
+        abstract void forEachCollected(GlobalOrdCountConsumer consumer) throws IOException;
+    }
+
+    interface GlobalOrdCountConsumer {
+        void accept(long globalOrd, long docCount) throws IOException;
     }
 
     interface BucketInfoConsumer {
@@ -775,6 +847,17 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
         @Override
         long getOrAddBucketOrd(long owningBucketOrd, long globalOrd) {
             return globalOrdToBucketOrd(owningBucketOrd, globalOrd);
+        }
+
+        @Override
+        void forEachCollected(GlobalOrdCountConsumer consumer) throws IOException {
+            final long size = Math.min(valueCount, docCounts.size());
+            for (long globalOrd = 0; globalOrd < size; globalOrd++) {
+                long docCount = docCounts.get(globalOrd);
+                if (docCount > 0) {
+                    consumer.accept(globalOrd, docCount);
+                }
+            }
         }
 
         @Override
@@ -861,6 +944,17 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
         @Override
         long getOrAddBucketOrd(long owningBucketOrd, long globalOrd) {
             return bucketOrds.add(owningBucketOrd, globalOrd);
+        }
+
+        @Override
+        void forEachCollected(GlobalOrdCountConsumer consumer) throws IOException {
+            LongKeyedBucketOrds.BucketOrdsEnum ordsEnum = bucketOrds.ordsEnum(0);
+            while (ordsEnum.next()) {
+                long docCount = bucketDocCount(ordsEnum.ord());
+                if (docCount > 0) {
+                    consumer.accept(ordsEnum.value(), docCount);
+                }
+            }
         }
 
         @Override

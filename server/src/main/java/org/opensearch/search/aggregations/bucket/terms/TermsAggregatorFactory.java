@@ -34,10 +34,12 @@ package org.opensearch.search.aggregations.bucket.terms;
 
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.Terms;
 import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.MatchAllDocsQuery;
 import org.apache.lucene.search.Query;
 import org.opensearch.core.ParseField;
+import org.opensearch.index.query.MatchAllQueryBuilder;
 import org.opensearch.index.query.QueryShardContext;
 import org.opensearch.search.DocValueFormat;
 import org.opensearch.search.aggregations.AggregationExecutionException;
@@ -60,6 +62,7 @@ import org.opensearch.search.aggregations.support.ValuesSource.Bytes.WithOrdinal
 import org.opensearch.search.aggregations.support.ValuesSourceAggregatorFactory;
 import org.opensearch.search.aggregations.support.ValuesSourceConfig;
 import org.opensearch.search.aggregations.support.ValuesSourceRegistry;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.streaming.FlushMode;
 import org.opensearch.search.streaming.StreamingCostEstimable;
@@ -799,5 +802,91 @@ public class TermsAggregatorFactory extends ValuesSourceAggregatorFactory implem
     @Override
     protected boolean supportsConcurrentSegmentSearch() {
         return true;
+    }
+
+    /**
+     * All terms execution paths (global ordinals incl. low-cardinality/remap/dense, map, numeric) collect doc-by-doc
+     * into per-collector state, which is partition-safe because the bulk scorer bounds each partition to its doc-id range.
+     * The whole-segment shortcuts are not partition-safe and are excluded: star-tree precompute is disabled for intra-segment
+     * at the request level (see DefaultSearchContext#evaluateRequestShouldUseIntraSegmentSearch) and the term-frequency
+     * precompute bails out when intra-segment search is active (see GlobalOrdinalsStringTermsAggregator#tryCollectFromTermFrequencies).
+     * <p>
+     * LIMITATION: For high cardinality fields with intra-segment enabled, bucket results may vary slightly from
+     * non-intra-segment execution, because each partition applies the shard_size cutoff independently before merging
+     * (similar to multi-shard behavior). doc_count_error_upper_bound and sum_other_doc_count account for this the same
+     * way they do across slices/shards. For exact results increase shard_size or disable intra-segment search.
+     */
+    @Override
+    protected boolean supportsIntraSegmentSearch() {
+        return true;
+    }
+
+    /**
+     * Declines intra-segment search when the term-frequency precompute
+     * ({@link GlobalOrdinalsStringTermsAggregator#tryCollectFromTermFrequencies}) is expected to apply to most of the shard.
+     * That fast path reads per-term doc frequencies from the terms dictionary in O(#terms) per segment, but it describes the
+     * whole segment and is therefore disabled when a segment is split into partitions; partitioned doc-by-doc collection is
+     * much slower than the precompute it replaces. Mirrors how date_histogram/range decline when their filter-rewrite fast
+     * path applies.
+     */
+    @Override
+    protected boolean supportsIntraSegmentSearch(SearchContext searchContext) {
+        return searchContext == null || termFrequencyPrecomputeLikely(searchContext) == false;
+    }
+
+    /**
+     * Whether the term-frequency precompute would apply to the majority of the shard's documents: a top-level string terms
+     * aggregation on an indexed field through global ordinals, without sub-aggregations, include/exclude, script or missing,
+     * a match-all query, and segments without deletions whose term count is within
+     * {@link SearchContext#termsAggregationMaxPrecomputeCardinality()}. Segments containing a {@code _doc_count} field are not
+     * detected here; for those the precompute bails out at runtime and the decision only costs parallelism.
+     */
+    boolean termFrequencyPrecomputeLikely(SearchContext searchContext) {
+        if (parent != null || factories.countAggregators() > 0 || includeExclude != null) {
+            return false;
+        }
+        if (executionHint != null && ExecutionMode.fromString(executionHint) == ExecutionMode.MAP) {
+            return false;
+        }
+        if (config.script() != null
+            || config.missing() != null
+            || config.fieldType() == null
+            || config.fieldType().isSearchable() == false) {
+            return false;
+        }
+        if ((config.getValuesSource() instanceof ValuesSource.Bytes.WithOrdinals.FieldData) == false) {
+            return false;
+        }
+        final String indexFieldName = ((ValuesSource.Bytes.WithOrdinals.FieldData) config.getValuesSource()).getIndexFieldName();
+        if (isMatchAllRequest(searchContext) == false || searchContext.searcher() == null) {
+            return false;
+        }
+        final long maxPrecomputeCardinality = searchContext.termsAggregationMaxPrecomputeCardinality();
+        long totalDocs = 0;
+        long eligibleDocs = 0;
+        try {
+            for (LeafReaderContext leaf : searchContext.searcher().getIndexReader().leaves()) {
+                final int maxDoc = leaf.reader().maxDoc();
+                totalDocs += maxDoc;
+                if (leaf.reader().hasDeletions()) {
+                    continue;
+                }
+                final Terms terms = leaf.reader().terms(indexFieldName);
+                if (terms != null && terms.size() != -1 && terms.size() <= maxPrecomputeCardinality) {
+                    eligibleDocs += maxDoc;
+                }
+            }
+        } catch (IOException e) {
+            return false;
+        }
+        return totalDocs > 0 && eligibleDocs * 2 > totalDocs;
+    }
+
+    private static boolean isMatchAllRequest(SearchContext searchContext) {
+        if (searchContext.request() == null) {
+            return false;
+        }
+        final SearchSourceBuilder source = searchContext.request().source();
+        return source == null || source.query() == null || source.query() instanceof MatchAllQueryBuilder;
     }
 }

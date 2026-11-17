@@ -21,8 +21,10 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 
 /**
@@ -76,7 +78,9 @@ public class BucketCollectorProcessor {
                 if (currentCollector instanceof Aggregator aggregator) {
                     // Do not perform postCollection for MultiBucketCollector as we are unwrapping that below
                     bucketCollector.postCollection();
-                    aggregator.buildTopLevel();
+                    if (defersBuildForSliceMerge(aggregator) == false) {
+                        aggregator.buildTopLevel();
+                    }
                 } else if (currentCollector instanceof MultiBucketCollector multiBucketCollector) {
                     for (Collector innerCollector : multiBucketCollector.getCollectors()) {
                         collectors.offer(innerCollector);
@@ -161,6 +165,8 @@ public class BucketCollectorProcessor {
      */
     public List<InternalAggregation> toInternalAggregations(Collection<Collector> collectors) throws IOException {
         List<InternalAggregation> internalAggregations = new ArrayList<>();
+        // slice instances of the same top-level aggregator that deferred their build, keyed by aggregator name
+        final Map<String, List<Aggregator>> deferred = new LinkedHashMap<>();
 
         final Deque<Collector> allCollectors = new LinkedList<>(collectors);
         while (!allCollectors.isEmpty()) {
@@ -170,11 +176,39 @@ public class BucketCollectorProcessor {
             }
 
             if (currentCollector instanceof Aggregator aggregator) {
-                internalAggregations.add(aggregator.getPostCollectionAggregation());
+                if (aggregator.getPostCollectionAggregation() == null && defersBuildForSliceMerge(aggregator)) {
+                    deferred.computeIfAbsent(aggregator.name(), k -> new ArrayList<>()).add(aggregator);
+                } else {
+                    internalAggregations.add(aggregator.getPostCollectionAggregation());
+                }
             } else if (currentCollector instanceof MultiBucketCollector multiBucketCollector) {
                 allCollectors.addAll(Arrays.asList(multiBucketCollector.getCollectors()));
             }
         }
+        for (List<Aggregator> sliceAggregators : deferred.values()) {
+            internalAggregations.add(mergeSlicesAndBuild(sliceAggregators));
+        }
         return internalAggregations;
+    }
+
+    /**
+     * Whether the given top-level aggregator skips the per-slice build so that the collected state of all slices can be
+     * merged first, see {@link IntraSegmentSliceMergeable}.
+     */
+    private static boolean defersBuildForSliceMerge(Aggregator aggregator) {
+        return aggregator.unwrapAggregator() instanceof IntraSegmentSliceMergeable mergeable && mergeable.canMergeIntraSegmentSlices();
+    }
+
+    /**
+     * Merges the collected state of all slice instances of a top-level aggregator into the first one and builds a single
+     * result from it. The (possibly profiling-wrapped) first instance is used for the build so that build time is profiled.
+     */
+    private static InternalAggregation mergeSlicesAndBuild(List<Aggregator> sliceAggregators) throws IOException {
+        final Aggregator target = sliceAggregators.get(0);
+        final IntraSegmentSliceMergeable mergeable = (IntraSegmentSliceMergeable) target.unwrapAggregator();
+        for (int i = 1; i < sliceAggregators.size(); i++) {
+            mergeable.mergeIntraSegmentSlice(sliceAggregators.get(i).unwrapAggregator());
+        }
+        return target.buildTopLevel();
     }
 }

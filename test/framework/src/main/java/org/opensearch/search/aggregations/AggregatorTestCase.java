@@ -823,6 +823,103 @@ public abstract class AggregatorTestCase extends OpenSearchTestCase {
     }
 
     /**
+     * Emulates (intra-segment) concurrent segment search on a single shard and returns the final reduced aggregation.
+     * <p>
+     * Every segment is split into {@code numPartitions} contiguous doc-id-range partitions. Partition {@code i} of every
+     * segment is assigned to slice {@code i} (Lucene requires partitions of the same segment to live in different slices),
+     * and each slice is collected by its own aggregator instance, exactly like ContextIndexSearcher does with
+     * MaxTargetSliceSupplier. Slice results are then reduced with a slice-level partial reduce (as the shard does for
+     * concurrent search, applying {@code shard_size}/{@code shard_min_doc_count}) followed by the coordinator's final reduce.
+     * Post-collection and building go through {@link BucketCollectorProcessor} like in production, so aggregators that merge
+     * their slices ({@link IntraSegmentSliceMergeable}) are exercised as well.
+     * <p>
+     * With {@code numPartitions == 1} this is plain concurrent segment search with a single slice holding whole segments,
+     * which is the natural non-intra baseline to compare against.
+     */
+    protected <A extends InternalAggregation> A searchAndReduceWithIntraSegmentPartitions(
+        IndexSettings indexSettings,
+        IndexSearcher searcher,
+        Query query,
+        AggregationBuilder builder,
+        int numPartitions,
+        int maxBucket,
+        MappedFieldType... fieldTypes
+    ) throws IOException {
+        assert numPartitions >= 1 : "numPartitions must be >= 1";
+        final IndexReaderContext ctx = searcher.getTopReaderContext();
+        final PipelineTree pipelines = builder.buildPipelineTree();
+        final Query rewritten = searcher.rewrite(query);
+        final boolean intraSegment = numPartitions > 1;
+        final BucketCollectorProcessor bucketCollectorProcessor = new BucketCollectorProcessor();
+        final List<Collector> sliceAggregators = new ArrayList<>();
+        BigArrays bigArrays = null;
+        for (int slice = 0; slice < numPartitions; slice++) {
+            List<LeafReaderContextPartition> slicePartitions = new ArrayList<>();
+            for (LeafReaderContext leaf : ctx.leaves()) {
+                int maxDoc = leaf.reader().maxDoc();
+                int minDocId = (int) ((long) maxDoc * slice / numPartitions);
+                int maxDocId = (int) ((long) maxDoc * (slice + 1) / numPartitions);
+                if (maxDocId > minDocId) {
+                    slicePartitions.add(
+                        intraSegment
+                            ? LeafReaderContextPartition.createFromAndTo(leaf, minDocId, maxDocId)
+                            : LeafReaderContextPartition.createForEntireSegment(leaf)
+                    );
+                }
+            }
+            ShardSearcher sliceSearcher = new ShardSearcher(slicePartitions.toArray(new LeafReaderContextPartition[0]), ctx);
+            MultiBucketConsumer sliceBucketConsumer = new MultiBucketConsumer(
+                maxBucket,
+                new NoneCircuitBreakerService().getBreaker(CircuitBreaker.REQUEST)
+            );
+            SearchContext searchContext = createSearchContext(searcher, indexSettings, query, sliceBucketConsumer, fieldTypes);
+            when(searchContext.shouldUseConcurrentSearch()).thenReturn(true);
+            when(searchContext.shouldUseIntraSegmentSearch()).thenReturn(intraSegment);
+            bigArrays = searchContext.bigArrays();
+            Aggregator aggregator = createAggregator(builder, searchContext);
+            aggregator.preCollection();
+            if (slicePartitions.isEmpty() == false) {
+                Weight weight = sliceSearcher.createWeight(rewritten, ScoreMode.COMPLETE, 1f);
+                sliceSearcher.search(weight, aggregator);
+            }
+            // post-collection on the slice, as ContextIndexSearcher does at the end of each slice
+            bucketCollectorProcessor.processPostCollection(aggregator);
+            sliceAggregators.add(aggregator);
+        }
+        // as AggregationCollectorManager#reduce does: build (or merge-then-build) the per-slice results
+        final List<InternalAggregation> sliceAggs = bucketCollectorProcessor.toInternalAggregations(sliceAggregators);
+
+        // shard-level (slice) reduce, see DefaultSearchContext#partialOnShard
+        InternalAggregation.ReduceContext sliceReduceContext = InternalAggregation.ReduceContext.forPartialReduction(
+            bigArrays,
+            getMockScriptService(),
+            () -> PipelineAggregator.PipelineTree.EMPTY
+        );
+        sliceReduceContext.setSliceLevel(true);
+        InternalAggregation shardResult = sliceAggs.get(0).reduce(sliceAggs, sliceReduceContext);
+
+        // coordinator final reduce of the single shard response
+        MultiBucketConsumer reduceBucketConsumer = new MultiBucketConsumer(
+            maxBucket,
+            new NoneCircuitBreakerService().getBreaker(CircuitBreaker.REQUEST)
+        );
+        InternalAggregation.ReduceContext context = InternalAggregation.ReduceContext.forFinalReduction(
+            bigArrays,
+            getMockScriptService(),
+            reduceBucketConsumer,
+            pipelines
+        );
+        @SuppressWarnings("unchecked")
+        A internalAgg = (A) shardResult.reduce(singletonList(shardResult), context);
+        internalAgg = (A) internalAgg.reducePipelines(internalAgg, context, pipelines);
+        for (PipelineAggregator pipelineAggregator : pipelines.aggregators()) {
+            internalAgg = (A) pipelineAggregator.reduce(internalAgg, context);
+        }
+        doAssertReducedMultiBucketConsumer(internalAgg, reduceBucketConsumer);
+        return internalAgg;
+    }
+
+    /**
      * Collects all documents that match the provided query {@link Query} and
      * returns the reduced {@link InternalAggregation}.
      * <p>
@@ -1079,8 +1176,12 @@ public abstract class AggregatorTestCase extends OpenSearchTestCase {
         private final LeafReaderContextPartition[] partitions;
 
         ShardSearcher(LeafReaderContextPartition partition, IndexReaderContext parent) {
+            this(new LeafReaderContextPartition[] { partition }, parent);
+        }
+
+        ShardSearcher(LeafReaderContextPartition[] partitions, IndexReaderContext parent) {
             super(parent);
-            this.partitions = new LeafReaderContextPartition[] { partition };
+            this.partitions = partitions;
         }
 
         public void search(Weight weight, Collector collector) throws IOException {
@@ -1089,7 +1190,9 @@ public abstract class AggregatorTestCase extends OpenSearchTestCase {
 
         @Override
         public String toString() {
-            return "ShardSearcher(" + partitions[0].ctx + ")";
+            return partitions.length == 1
+                ? "ShardSearcher(" + partitions[0].ctx + ")"
+                : "ShardSearcher(" + partitions.length + " partitions)";
         }
     }
 

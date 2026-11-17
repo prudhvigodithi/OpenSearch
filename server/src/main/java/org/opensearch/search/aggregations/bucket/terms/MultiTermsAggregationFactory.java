@@ -211,6 +211,20 @@ public class MultiTermsAggregationFactory extends AggregatorFactory {
     }
 
     /**
+     * multi_terms collects doc-by-doc (both the global-ordinal and the byte-key paths) into per-collector state, which is
+     * partition-safe because the bulk scorer bounds each partition to its doc-id range. Its only whole-segment shortcut,
+     * the star-tree precompute, is disabled for intra-segment at the request level.
+     * <p>
+     * LIMITATION: For high cardinality fields with intra-segment enabled, bucket results may vary slightly from
+     * non-intra-segment execution, because each partition applies the shard_size cutoff independently before merging
+     * (similar to multi-shard behavior). For exact results increase shard_size or disable intra-segment search.
+     */
+    @Override
+    protected boolean supportsIntraSegmentSearch() {
+        return true;
+    }
+
+    /**
      * Supplier for internal values source
      *
      * @opensearch.internal
